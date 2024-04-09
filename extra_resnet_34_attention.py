@@ -1,0 +1,251 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Oct 24 00:11:58 2023
+
+@author: Anish Hilary
+"""
+
+
+import torch
+import torch.nn as nn
+import math
+from sca_module import SCA
+import torch.utils.model_zoo as model_zoo
+import pickle
+import utils_atten
+
+
+__all__ = ['ResNet', 'resnet18_', 'resnet34_']
+
+
+model_urls = {
+    'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
+    'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
+}
+
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, lay_4=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.attention1 = SCA(planes, planes, lay_4)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.attention2 = SCA(planes,planes, lay_4)
+        self.bn2 = nn.BatchNorm2d(planes)
+        
+        self.downsample = downsample
+        self.stride = stride
+
+        if self.downsample is not None:
+            self.conv_down = nn.Conv2d(downsample['inplane'],downsample['plane'],
+                                       kernel_size=downsample['kernel'],
+                                       stride=downsample['stride'], bias=downsample['bias'])
+            self.attention_down = SCA(downsample['plane'],downsample['plane'], lay_4)
+            self.bn_down = nn.BatchNorm2d(downsample['plane'])
+
+            
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out, wgts = self.attention1(out)
+        utils_atten.channel_wgt_list.append(wgts)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out, wgts = self.attention2(out)
+        utils_atten.channel_wgt_list.append(wgts)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            residual = self.conv_down(x)
+            residual, wgts = self.attention_down(residual)
+            utils_atten.channel_wgt_list.append(wgts)
+            residual = self.bn_down(residual)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        self.attention1 = SCA(planes,16)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.attention2 = SCA(planes,16)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
+        self.attention3 = SCA(planes * 4,16)
+        self.bn3 = nn.BatchNorm2d(planes * 4)
+        self.relu = nn.ReLU(inplace=True)
+        
+        self.downsample = downsample
+
+        if self.downsample is not None:
+            self.conv_down = nn.Conv2d(downsample['inplane'],downsample['plane'],
+                                       kernel_size=downsample['kernel'],
+                                       stride=downsample['stride'], bias=downsample['bias'])
+            self.attention_down = SCA(downsample['plane'],16)
+            self.bn_down = nn.BatchNorm2d(downsample['plane'])
+                                     
+        else:
+            self.downsample = downsample
+            self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out, wgts = self.attention1(out)
+        utils_atten.channel_wgt_list.append(wgts)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out, wgts = self.attention2(out)
+        utils_atten.channel_wgt_list.append(wgts)
+        out = self.bn2(out)
+        out = self.relu(out)
+        out = self.conv3(out)
+        out, wgts = self.attention3(out)
+        utils_atten.channel_wgt_list.append(wgts)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.conv_down(x)
+            residual, wgts = self.attention_down(residual)
+            utils_atten.channel_wgt_list.append(wgts)
+            residual = self.bn_down(residual)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class ResNet(nn.Module):
+
+    def __init__(self, block, layers, num_classes=1000):
+        self.inplanes = 64
+        super(ResNet, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0], lay_4 = False)
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2, lay_4 = False)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, lay_4 = False)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2, lay_4 = True )
+        
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+    def _make_layer(self, block, planes, blocks, stride=1, lay_4=None):
+        downsample = None
+        layer_4 = lay_4
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = {"inplane":self.inplanes, "plane":planes * block.expansion,"kernel":1,
+                          "stride":stride, "bias":False}
+
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample, layer_4))
+        self.inplanes = planes * block.expansion
+        
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes, stride=1, downsample=None, lay_4=layer_4))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+
+        utils_atten.init_global()
+        
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        
+        with open('wght_list.pkl', 'wb') as f:
+            pickle.dump(utils_atten.channel_wgt_list, f)
+        
+        return x
+
+
+def resnet18_(pretrained=False, **kwargs):
+    """Constructs a ResNet-18 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
+    if pretrained:
+        pretrained_state_dict = model_zoo.load_url(model_urls['resnet18'])
+        now_state_dict        = model.state_dict()
+        now_state_dict.update(pretrained_state_dict)
+        model.load_state_dict(now_state_dict)
+    return model
+
+
+def resnet34_(pretrained=False, **kwargs):
+    """Constructs a ResNet-34 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
+    if pretrained:
+        pretrained_state_dict = model_zoo.load_url(model_urls['resnet34'])
+        now_state_dict        = model.state_dict()
+        now_state_dict.update(pretrained_state_dict)
+        model.load_state_dict(now_state_dict)
+    return model
+
+
+
+
+if __name__ == '__main__':
+    res_34 = resnet34_()
+    inp = torch.randn(2,3,32,32)
+    outt = res_34(inp)
+    
+
+    

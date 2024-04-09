@@ -1,0 +1,13 @@
+# -*- coding: utf-8 -*-
+
+
+
+dataset_name: 'cifar-10'
+train_batch_size: 4
+eval_batch_size: 4
+
+epochs: 40
+lr: 0.001
+lr_decay_step: [30,80,150]
+
+num_classes: 10
